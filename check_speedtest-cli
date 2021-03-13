@@ -1,0 +1,461 @@
+#!/bin/sh
+#
+# Script to check Internet connection speed using speedtest-cli
+#
+# By Tom Dawes - https://github.com/mistake-not
+#
+# Based on the work of Jon Witts and others -
+#   https://github.com/jonwitts/nagios-speedtest/
+#
+#######################################
+#
+# Nagios Exit Codes
+#
+# 0 = OK       = The plugin was able to check the service and it appeared to be
+#                functioning properly
+# 1 = Warning  = The plugin was able to check the service, but it appeared to
+#                be above some warning threshold or did not appear to be
+#                working properly
+# 2 = Critical = The plugin detected that either the service was not running or
+#                it was above some critical threshold
+# 3 = Unknown  = Invalid command line arguments were supplied to the plugin or
+#                low-level failures internal to the plugin (such as unable to
+#                fork, or open a tcp socket) that prevent it from performing
+#                the specified operation. Higher-level errors (such as name
+#                resolution errors, socket timeouts, etc) are outside of the
+#                control of plugins and should generally NOT be reported as
+#                UNKNOWN states.
+#
+#######################################
+
+plugin_name="Nagios speedtest-cli plugin"
+version="1.0"
+
+# SET THE PATH TO THE SPEEDTEST BINARY HERE:
+STb=/usr/local/bin/speedtest-cli
+
+
+#######################################
+#
+# CHANGELOG
+#
+# V1.0 - Initial Release based on https://github.com/jonwitts/nagios-speedtest/
+#        Made to work with Almquist rather than Bourne Again shell
+#        Adds option to determine Speetest server automatically
+#
+#######################################
+
+#######################################
+# function to output full script usage
+# Globals:
+#   plugin_name
+#   version
+#######################################
+usage() {
+cat << EOF
+
+*******************************************************************************
+
+    $plugin_name - Version: $version
+
+EOF
+
+    arguments
+        
+cat << EOF
+
+    This script will output the Internet Connection Speed using speedtest-cli
+    to Nagios.
+
+    You need to have installed speedtest-cli on your system first and ensured
+    that it is working by calling "speedtest --simple".
+
+    See here: https://github.com/sivel/speedtest-cli for info
+
+    First you MUST define the location of your speedtest install in the script
+    or this will not work. Currently $STb
+
+    The speedtest-cli can take some time to return its result. Do some tests
+    runs of speedtest-cli and update service_check_timeout in your main
+    nagios.cfg to a comfortable value. Be aware of the potential impact on your
+    Nagios system when doing this. A busy system might begin to struggle if any
+    stalled check processes are allowed to persist for too long.
+
+    You also need to have access to bc on your system for this script to work
+    and that it exists in your path.
+
+    Your warning levels must be higher than your critical levels for both
+    upload and download.
+
+    Performance Data will output upload and download speed against matching
+    warning and critical levels.
+
+    Jon Witts
+
+*******************************************************************************
+EOF
+}
+
+#######################################
+# function to output full script arguments
+#######################################
+arguments() {
+    cat << EOF
+    OPTIONS:
+    -h    Show usage
+    -w    Download Warning Level - *Required* - integer or decimal Mbit/s
+    -c    Download Critical Level - *Required* - integer or decimal Mbit/s
+    -W    Upload Warning Level - *Required* - integer or decimal Mbit/s
+    -C    Upload Critical Level - *Required* - integer or decimal Mbit/s
+    -l    Location of speedtest server - *Required* - takes one of:
+              "i" internal Mini Server, set url with -s
+              "e" external server, set id with -s, list ids with
+                  speedtest-cli --list
+              "p" automatically select a server
+    -s    Server integer, URL - *Required with -l i and -l e*
+    -p    Output Performance Data
+    -m    Download Maximum Level - *Required with -p*
+          - integer or decimal Mbit/s
+          Provide the maximum possible download level for your connection
+    -M    Upload Maximum Level - *Required if you request perfdata*
+          - integer or decimal Mbit/s
+          Provide the maximum possible upload level for your connection
+    -v    Output plugin version
+    -V    Output debug info for testing
+EOF
+}
+
+#######################################
+# function to output error if speedtest binary location not set
+# Globals:
+#   plugin_name
+#   version
+#######################################
+locundef() {
+    cat << EOF
+*******************************************************************************
+
+    $plugin_name - Version: $version
+
+    You have not defined the location of the speedtest binary in the script!
+    You MUST do this before running the script. This is set towards the top of
+    the script!
+
+*******************************************************************************
+EOF
+}
+
+#######################################
+# function to check if a variable is numeric expects variable to check as first
+# argument and human description of variable as second
+# Arguments:
+#   a variable to test
+#######################################
+isnumeric() {
+    re='\([0-9]\{1,\}\([.][0-9]\{1,\}\)\{0,1\}\)$'
+    test=$(expr "$1" : "$re")
+    if ! [ "$test" ]; then
+        echo "****CONFIG ERROR************************"
+        echo "$2 with a value of: $1 is not a number!"
+        echo "****************************************"
+    exit 3
+    fi
+}
+
+#######################################
+# functions for floating point operations - requires bc!
+#
+# Default scale used by float functions.
+#######################################
+float_scale=3
+
+#######################################
+# Evaluate a floating point number expression.
+# Globals:
+#   float_scale
+# Arguments:
+#   expression string
+#######################################
+float_eval() {
+    local stat=0
+    local result=0.0
+    if [ $# -gt 0 ]; then
+        # second statement prints the missing 0 if the result < 1
+        result=$(echo "
+                scale=$float_scale;
+                if ($1 < $3) print 0;
+                $*" | bc -q 2>/dev/null)
+        stat=$?
+        if [ $stat -eq 0  ] && [ -z "$result" ]; then stat=1; fi
+    fi
+    echo $result
+    return $stat
+}
+
+#######################################
+# Evaluate a floating point number conditional expression.
+# Arguments:
+#   expression string
+#######################################
+float_cond() {
+    local cond=0
+    if [ $# -gt 0 ]; then
+        cond=$(echo "$*" | bc -q 2>/dev/null)
+        echo "$cond"
+        if [ -z "$cond" ]; then cond=0; fi
+        if [ "$cond" != 0 ] && [ "$cond" != 1 ]; then cond=0; fi
+    fi
+    local stat=$((cond == 0))
+    return $stat
+}
+
+########### End of functions ##########
+
+# Set up the variables to take the arguments
+DLw=
+DLc=
+ULw=
+ULc=
+Loc=
+SEs=
+PerfData=
+MaxDL=
+MaxUL=
+debug=
+
+# Retrieve the arguments using getopts
+while getopts "hw:c:W:C:l:s:pm:M:vV" OPTION
+do
+    case $OPTION in
+    h)
+        usage
+        exit 3
+        ;;
+    w)
+        DLw=$OPTARG
+        ;;
+    c)
+        DLc=$OPTARG
+        ;;
+    W)
+        ULw=$OPTARG
+        ;;
+    C)
+        ULc=$OPTARG
+        ;;
+    l)
+        Loc=$OPTARG
+        ;;
+    s)
+        SEs=$OPTARG
+        ;;
+    p)
+        PerfData="TRUE"
+        ;;
+    m)
+        MaxDL=$OPTARG
+        ;;
+    M)
+        MaxUL=$OPTARG
+        ;;
+    v)
+        echo "$plugin_name. Version number: $version"
+        exit 3
+        ;;
+    V)
+        debug="TRUE"
+        ;;
+esac
+done
+
+# Check if the Speedtest binary is available and exit with warning if not
+if ! command -v $STb > /dev/null 2>&1; then
+    locundef
+    exit 3
+fi
+
+# Check for empty mandatory arguments and exit to usage if found
+if  [ -z $DLw ] || [ -z $DLc ] || [ -z $ULw ] || [ -z $ULc ] || \
+    [ -z $Loc ] || [ -z $SEs ]; then
+    echo "*****CONFIG ERROR***********************"
+    echo "Required arguments are:"
+    echo "Download warning threshold (-w)"
+    echo "Download critical threshold (-c)"
+    echo "Upload warning threshold (-U)"
+    echo "Upload critical threshold (-C)"
+    echo "Server location mode (-l)"
+    echo "****************************************"
+    exit 3
+fi
+
+# Check for empty upload and download maximum arguments if perfdata requested
+if [ -z $MaxDL ] || [ -z $MaxUL ] && [ "$PerfData" = "TRUE" ]; then
+    echo "****CONFIG ERROR************************"
+    echo "You have requested perdata (-p), so max"
+    echo "download (-m) and max upload (-M)"
+    echo "arguments are required."
+    echo "****************************************"
+    exit 3
+fi
+
+# Check for invalid argument passed to $Loc and exit to usage if found
+if [ "$Loc" != "e" ] && [ "$Loc" != "i" ] && [ "$Loc" != "p" ]; then
+    echo "****CONFIG ERROR************************"
+    echo "Server location mode (-l) must be one of"
+    echo "e(xternal) by server id number in -s"
+    echo "i(internal) by url in -s"
+    echo "p(ing) by ping test"
+    echo "****************************************"
+    exit 3
+fi
+
+# Check for non-numeric arguments
+isnumeric $DLw "Download Warning Level"
+isnumeric $DLc "Download Critical Level"
+isnumeric $ULw "Upload Warning Level"
+isnumeric $ULc "Upload Critical Level"
+# Only check upload and download maximums if perfdata requested
+if [ "$PerfData" = "TRUE" ]; then
+    isnumeric $MaxDL "Download Maximum Level"
+    isnumeric $MaxUL "Upload Maximum Level"
+fi
+
+# Check if binary bc is installed
+type bc >/dev/null 2>&1 || {
+    echo >&2 "Please install bc binary (for floating point operations)"
+    exit 3
+}
+
+# Check that warning levels are not less than critical levels
+if ! [ $(float_cond "$DLw < $DLc") ]; then
+    echo "****CONFIG ERROR************************"
+    echo "Download warning threshold (-w) must be"
+    echo "less than critical threshold (-c)"
+    echo "****************************************"
+    exit 3
+fi
+
+if ! [ $(float_cond "$ULw < $ULc") ]; then
+    echo "****CONFIG ERROR************************"
+    echo "Upload warning threshold (-w) must be"
+    echo "less than critical threshold (-c)"
+    echo "****************************************"
+    exit 3
+fi
+
+# Output arguments for debug
+if [ "$debug" = "TRUE" ]; then
+    echo "****DEBUG*******************************"
+    echo "Download Warning Level = "$DLw
+    echo "Download Critical Level = "$DLc
+    echo "Upload Warning Level = "$ULw
+    echo "Upload Critical Level = "$ULc
+    echo "Server Location = "$Loc
+    echo "Server URL or Integer = "$SEs
+    echo "****************************************"
+fi
+
+#Set command up depending upon server location mode
+if [ "$Loc" = "e" ]; then
+    command=$($STb --server=$SEs --csv)
+    if [ "$debug" = "TRUE" ]; then
+        echo "External Server defined"
+    fi
+elif [ "$Loc" = "i" ]; then
+    command=$($STb --mini=$SEs --csv)
+    if [ "$debug" = "TRUE" ]; then
+        echo "Internal Server defined"
+    fi
+elif [ "$Loc" = "p" ]; then
+    command=$($STb --csv)
+    if [ "$debug" = "TRUE" ]; then
+        echo "Ping server mode"
+    fi
+else
+    echo "****ERROR*******************************"
+    echo "Server location mode unexpected error"
+    echo "****************************************"
+    exit 3
+fi
+
+# Parse the csv output of the command
+originalIFS="$IFS"
+IFS=, read -r server_id sponsor server_name timestamp distance ping download upload share ip_address << EOF
+$command
+EOF
+IFS="$originalIFS"
+
+# Convert values in bps to mbps
+download=$(float_eval "$download / 1000000")
+upload=$(float_eval "$upload / 1000000")
+
+# Output array indicies count for debug
+if [ "$debug" = "TRUE" ]; then
+    echo "****DEBUG*******************************"
+    echo "Command output:"
+    echo "  $command"
+    echo "Parsed test results:"
+    echo "  Server ID: $server_id"
+    echo "  Sponsor: $sponsor"
+    echo "  Server name: $server_name"
+    echo "  Timestamp: $timestamp"
+    echo "  Distance: $distance"
+    echo "  Ping: $ping"
+    echo "  Download: $download"
+    echo "  Upload: $upload"
+    echo "  Share: $share"
+    echo "  IP address: $ip_address"
+    echo "****************************************"
+fi
+
+#set up our nagios status and exit code variables
+status=
+nagcode=
+
+# now we check to see if returned values are within defined ranges
+# we will make use of bc for our math!
+if [ "$(float_cond "$download < $DLc")" ]; then
+    if [ "$debug" = "TRUE" ]; then
+        echo "Download rate ($download) less than critical limit ($DLc)"
+    fi
+    status="CRITICAL"
+    nagcode=2
+elif float_cond "$upload < $ULc"; then
+    if [ "$debug" = "TRUE" ]; then
+        echo "Upload rate ($upload) less than critical limit ($ULc)"
+    fi
+    status="CRITICAL"
+    nagcode=2
+elif float_cond "$download < $DLw"; then
+    if [ "$debug" = "TRUE" ]; then
+        echo "Download rate ($download) less than warning limit ($DLw)"
+    fi
+    status="WARNING"
+    nagcode=1
+elif float_cond "$upload < $ULw"; then
+    if [ "$debug" = "TRUE" ]; then
+        echo "Upload rate ($upload) less than warning limit ($ULw)"
+    fi
+    status="WARNING"
+    nagcode=1
+else
+    if [ "$debug" = "TRUE" ]; then
+        echo "Everything within bounds!"
+    fi
+    status="OK"
+    nagcode=0
+fi
+
+nagout="$status - Ping = $ping $pingUOM Download = $download $downloadUOM Upload = $upload $uploadUOM"
+
+# append perfout if argument was passed to script
+if [ "$PerfData" = "TRUE" ]; then
+    if [ "$debug" = "TRUE" ]; then
+        echo "PerfData requested!"
+    fi
+    perfout="|'download'=$download;$DLw;$DLc;0;$(echo $MaxDL*1.05|bc) 'upload'=$upload;$ULw;$ULc;0;$(echo $MaxUL*1.05|bc)"
+    nagout=$nagout$perfout
+fi
+
+echo $nagout
+exit $nagcode
