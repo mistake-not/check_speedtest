@@ -32,7 +32,7 @@ plugin_name="Nagios speedtest-cli plugin"
 version="1.0"
 
 # SET THE PATH TO THE SPEEDTEST BINARY HERE:
-STb=/usr/local/bin/speedtest-cli
+STb=speedtest-cli
 
 
 #######################################
@@ -122,26 +122,6 @@ arguments() {
           Provide the maximum possible upload level for your connection
     -v    Output plugin version
     -V    Output debug info for testing
-EOF
-}
-
-#######################################
-# function to output error if speedtest binary location not set
-# Globals:
-#   plugin_name
-#   version
-#######################################
-locundef() {
-    cat << EOF
-*******************************************************************************
-
-    $plugin_name - Version: $version
-
-    You have not defined the location of the speedtest binary in the script!
-    You MUST do this before running the script. This is set towards the top of
-    the script!
-
-*******************************************************************************
 EOF
 }
 
@@ -270,18 +250,24 @@ done
 
 # Check if the Speedtest binary is available and exit with warning if not
 if ! command -v $STb > /dev/null 2>&1; then
-    locundef
+    echo "*****CONFIG ERROR***********************"
+    echo "Cannot find speedtest-cli binary at the"
+    echo "location specified in the script:"
+    echo "  $STb"
+    echo "Complete the line beginning STb= in the"
+    echo "check_speedtest-cli script"
+    echo "****************************************"
     exit 3
 fi
 
 # Check for empty mandatory arguments and exit to usage if found
 if  [ -z $DLw ] || [ -z $DLc ] || [ -z $ULw ] || [ -z $ULc ] || \
-    [ -z $Loc ] || [ -z $SEs ]; then
+    [ -z $Loc ]; then
     echo "*****CONFIG ERROR***********************"
     echo "Required arguments are:"
     echo "Download warning threshold (-w)"
     echo "Download critical threshold (-c)"
-    echo "Upload warning threshold (-U)"
+    echo "Upload warning threshold (-W)"
     echo "Upload critical threshold (-C)"
     echo "Server location mode (-l)"
     echo "****************************************"
@@ -299,12 +285,13 @@ if [ -z $MaxDL ] || [ -z $MaxUL ] && [ "$PerfData" = "TRUE" ]; then
 fi
 
 # Check for invalid argument passed to $Loc and exit to usage if found
-if [ "$Loc" != "e" ] && [ "$Loc" != "i" ] && [ "$Loc" != "p" ]; then
+if { [ ! "$Loc" = "e" ] && [ ! "$Loc" = "i" ] && [ ! "$Loc" = "p" ] ; } \
+|| { [ "$Loc" = "e" ] || [ "$Loc" = "i" ] && [ -z $SEs ] ; }; then
     echo "****CONFIG ERROR************************"
     echo "Server location mode (-l) must be one of"
-    echo "e(xternal) by server id number in -s"
-    echo "i(internal) by url in -s"
-    echo "p(ing) by ping test"
+    echo "  e(xternal) with server id number in -s"
+    echo "  i(internal) with url in -s"
+    echo "  p(ing) by ping test -s not required"
     echo "****************************************"
     exit 3
 fi
